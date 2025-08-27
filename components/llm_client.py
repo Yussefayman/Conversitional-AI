@@ -1,9 +1,16 @@
-# components/llm_client.py
 import os
 import json
 from groq import Groq
 from typing import Dict, Any
 from datetime import datetime, timedelta
+import sys
+import os
+
+sys.path.append(os.getcwd())
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class LLMClient:
     def __init__(self, api_key: str = None):
@@ -16,39 +23,44 @@ class LLMClient:
         self.model = "llama3-70b-8192" 
     
     def process_message(self, user_input: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process user message and return structured response
-        
-        Args:
-            user_input: User's message
-            context: Current conversation context
-            
-        Returns:
-            Dict with action_type, intent, entities, response, etc.
-        """
         try:
-            # Build prompt with context
             prompt = self._build_prompt(user_input, context)
-            
-            # Call Groq
             raw_response = self._call_groq(prompt)
-            
-            # Parse JSON response
             parsed_response = self._parse_response(raw_response)
-            
+
+            # ✅ Only mark as "saveable" if ready_to_execute is True
+            required_fields = {
+                "schedule_meeting": ["date", "time", "participants"],
+                "send_email": ["recipient", "subject", "body"]
+            }
+
+            intent = parsed_response.get("intent")
+            entities = parsed_response.get("entities", {})
+            missing = []
+
+            if intent in required_fields:
+                for field in required_fields[intent]:
+                    if not entities.get(field):
+                        missing.append(field)
+
+            if missing:
+                parsed_response["ready_to_execute"] = False
+                parsed_response["missing_entities"] = missing
+
+            # 🚫 Don’t save prematurely → return only
             return parsed_response
-            
+
         except Exception as e:
-            # Fallback response for errors
             return {
                 "action_type": "error",
                 "intent": "chitchat",
                 "entities": {},
-                "response": f"Sorry, I had trouble processing that. Could you try again?",
+                "response": "Sorry, I had trouble processing that. Could you try again?",
                 "needs_confirmation": False,
                 "ready_to_execute": False,
                 "error": str(e)
             }
+
     
     def _build_prompt(self, user_input: str, context: Dict[str, Any]) -> str:
         """Build the prompt for Groq with date awareness"""
@@ -86,6 +98,7 @@ CONTEXT RULES:
 - For emails, you need actual email addresses (with @domain.com)
 - If user gives names without email addresses, ask for the actual email addresses
 - If user says just names like "sarah and ahmed" when asked for emails, ask for their email addresses
+- Don't schedule or sent an email before you make sure you have all information
 - When user confirms ("yes") but info is still missing, ask for the missing info instead of executing
 
 Respond with valid JSON using DOUBLE QUOTES only:
@@ -115,6 +128,7 @@ CALCULATION EXAMPLES:
 - "in two weeks" = {(datetime.now() + timedelta(weeks=2)).strftime('%Y-%m-%d')}
 
 RULES:
+- Don't schedule a meeting before taking all informatin: date,time, participants emails.
 - If user says "actually", "wait", "change", "make it" etc. → correction_detected: true
 - For new requests → action_type: "new_intent"
 - For "yes"/"no" responses → action_type: "confirmation"
@@ -126,7 +140,7 @@ RULES:
 EXAMPLES (valid JSON with DOUBLE QUOTES):
 
 Input: "I want to schedule a meeting"
-{{"action_type": "new_intent", "intent": "schedule_meeting", "entities": {{"title": "meeting"}}, "missing_entities": ["date", "time"], "response": "I'd be happy to schedule a meeting for you. When would you like to schedule it and what time?", "needs_confirmation": false, "ready_to_execute": false}}
+{{"action_type": "new_intent", "intent": "schedule_meeting", "entities": {{"title": "meeting"}}, "missing_entities": ["date", "time", "participants emails"], "response": "I'd be happy to schedule a meeting for you. When would you like to schedule it and what time?", "needs_confirmation": false, "ready_to_execute": false}}
 
 Input: "in 2 days" (when providing missing date info)
 {{"action_type": "correction", "intent": "schedule_meeting", "entities": {{"date": "{(datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d')}"}}, "correction_detected": true, "missing_entities": ["time"], "response": "Got it, in 2 days. What time would you like to schedule the meeting?", "needs_confirmation": false, "ready_to_execute": false}}

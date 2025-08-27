@@ -3,11 +3,13 @@ from typing import Dict, Any, List
 from datetime import datetime
 import copy
 from .llm_client import LLMClient
+from utils.helpers import save_action_to_outbox, list_saved_actions, get_action_summary
 
 class ConversationManager:
-    def __init__(self, llm_client: LLMClient):
-        """Initialize conversation manager with LLM client"""
+    def __init__(self, llm_client: LLMClient, outbox_dir: str = "outbox"):
+        """Initialize conversation manager with LLM client and outbox directory"""
         self.llm_client = llm_client
+        self.outbox_dir = outbox_dir
         self.max_history = 10  # Keep last 10 exchanges
         
         # Initialize conversation state
@@ -21,7 +23,8 @@ class ConversationManager:
             "awaiting_confirmation": False,
             "awaiting_email_addresses": False,  # Flag for email address requests
             "history": [],
-            "session_active": False
+            "session_active": False,
+            "last_saved_action": None  # Track the last saved action
         }
     
     def process_message(self, user_input: str) -> Dict[str, Any]:
@@ -32,7 +35,7 @@ class ConversationManager:
             user_input: User's message
             
         Returns:
-            Dict with response, confirmation status, etc.
+            Dict with response, confirmation status, execution info, etc.
         """
         try:
             # Build context for LLM
@@ -43,6 +46,13 @@ class ConversationManager:
             
             # Update conversation state based on LLM response
             self._update_state_from_llm_response(llm_response, user_input)
+            
+            # Check if action is ready for execution and auto-save
+            execution_result = self._handle_action_execution()
+            
+            # Add execution info to response
+            if execution_result:
+                llm_response["execution_result"] = execution_result
             
             # Add to history
             self._add_to_history(user_input, llm_response["response"])
@@ -63,6 +73,72 @@ class ConversationManager:
             
             self._add_to_history(user_input, error_response["response"])
             return error_response
+    
+    def _handle_action_execution(self) -> Dict[str, Any]:
+        """
+        Handle automatic execution (saving) of ready actions
+        
+        Returns:
+            Dict with execution result info, or None if not ready
+        """
+        if not self.is_ready_for_execution():
+            return None
+        
+        try:
+            # Get action data
+            action_data = self.get_action_for_execution()
+            if not action_data:
+                return None
+            
+            # Save to outbox
+            save_result = save_action_to_outbox(action_data, self.outbox_dir)
+            
+            if save_result["success"]:
+                # Mark this action as saved
+                self.state["last_saved_action"] = {
+                    "filename": save_result["filename"],
+                    "filepath": save_result["filepath"],
+                    "action_type": action_data["type"],
+                    "summary": get_action_summary(action_data),
+                    "saved_at": datetime.now().isoformat()
+                }
+                
+                # Reset session after successful save
+                self._reset_session_after_execution()
+                
+                return {
+                    "success": True,
+                    "action_executed": True,
+                    "filename": save_result["filename"],
+                    "filepath": save_result["filepath"],
+                    "summary": get_action_summary(action_data),
+                    "message": f"✅ {action_data['type'].replace('_', ' ').title()} saved successfully!"
+                }
+            else:
+                return {
+                    "success": False,
+                    "action_executed": False,
+                    "error": save_result["error"],
+                    "message": f"❌ Failed to save {action_data['type']}: {save_result['error']}"
+                }
+                
+        except Exception as e:
+            return {
+                "success": False,
+                "action_executed": False,
+                "error": str(e),
+                "message": f"❌ Execution error: {str(e)}"
+            }
+    
+    def _reset_session_after_execution(self):
+        """Reset session state after successful action execution, but keep history"""
+        history = self.state["history"].copy()  # Preserve history
+        last_saved = self.state["last_saved_action"].copy()  # Preserve last saved action
+        
+        self._reset_state()
+        
+        self.state["history"] = history
+        self.state["last_saved_action"] = last_saved
     
     def _build_context_for_llm(self) -> Dict[str, Any]:
         """Build context dictionary for LLM"""
@@ -121,9 +197,7 @@ class ConversationManager:
             # Handle yes/no responses
             if llm_response.get("ready_to_execute"):
                 self.state["awaiting_confirmation"] = False
-                # Final check - if we still don't have required entities, don't mark as ready
-                if not self._has_required_entities():
-                    self.state["awaiting_confirmation"] = False  # We need more info, not confirmation
+                # Note: Actual execution handled in _handle_action_execution()
             else:
                 # User said no - reset session
                 self._reset_state()
@@ -237,6 +311,11 @@ class ConversationManager:
             else:
                 display_parts.append("🔄 **Status:** Processing your request")
         
+        # Show last saved action if any
+        if self.state.get("last_saved_action"):
+            last_saved = self.state["last_saved_action"]
+            display_parts.append(f"💾 **Last Saved:** {last_saved['summary']}")
+        
         # Recent history count
         if self.state["history"]:
             display_parts.append(f"💭 **Exchanges:** {len(self.state['history'])}")
@@ -283,5 +362,31 @@ class ConversationManager:
             "type": self.state["intent"],
             "entities": self.state["entities"],
             "timestamp": datetime.now().isoformat(),
-            "conversation_id": id(self)  # Simple conversation ID
+            "conversation_id": f"conv_{id(self)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         }
+    
+    def get_saved_actions_summary(self, limit: int = 5) -> List[str]:
+        """Get a summary of recently saved actions"""
+        try:
+            actions = list_saved_actions(self.outbox_dir, limit=limit)
+            return [get_action_summary(action) for action in actions]
+        except Exception as e:
+            return [f"❌ Error loading saved actions: {str(e)}"]
+    
+    def get_outbox_stats(self) -> Dict[str, Any]:
+        """Get statistics about the outbox"""
+        try:
+            actions = list_saved_actions(self.outbox_dir)
+            
+            total = len(actions)
+            meeting_count = len([a for a in actions if a.get("type") == "schedule_meeting"])
+            email_count = len([a for a in actions if a.get("type") == "send_email"])
+            
+            return {
+                "total_actions": total,
+                "meetings": meeting_count,
+                "emails": email_count,
+                "last_saved": actions[0].get("saved_at") if actions else None
+            }
+        except Exception as e:
+            return {"error": str(e)}

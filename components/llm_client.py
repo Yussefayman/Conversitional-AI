@@ -20,7 +20,7 @@ class LLMClient:
             raise ValueError("GROQ_API_KEY not found in environment variables")
         
         self.client = Groq(api_key=self.api_key)
-        self.model = "llama3-70b-8192" 
+        self.model = "llama-3.3-70b-versatile" 
     
     def process_message(self, user_input: str, context: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -28,7 +28,6 @@ class LLMClient:
             raw_response = self._call_groq(prompt)
             parsed_response = self._parse_response(raw_response)
 
-            # ✅ Only mark as "saveable" if ready_to_execute is True
             required_fields = {
                 "schedule_meeting": ["date", "time", "participants"],
                 "send_email": ["recipient", "subject", "body"]
@@ -61,105 +60,51 @@ class LLMClient:
                 "error": str(e)
             }
 
-    
+
     def _build_prompt(self, user_input: str, context: Dict[str, Any]) -> str:
-        """Build the prompt for Groq with date awareness"""
+        """Build concise prompt for Groq"""
         
-        context_str = self._format_context(context)
-        current_date = datetime.now().strftime("%A, %B %d, %Y")
-        current_date_iso = datetime.now().strftime("%Y-%m-%d")
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        current_entities = context.get("entities", {})
+        current_intent = context.get("intent")
         
-        # Check if we're waiting for email addresses
-        awaiting_emails = context.get("awaiting_email_addresses", False)
-        current_participants = context.get("entities", {}).get("participants", [])
-        
-        email_context = ""
-        if awaiting_emails and current_participants:
-            email_context = f"""
-SPECIAL CONTEXT: The user was asked for email addresses for these people: {current_participants}
-If the user provides names like "sarah and ahmed", convert them to email format or ask for actual email addresses.
-If the user provides email addresses, use those directly.
-"""
-        
-        prompt = f"""You are a conversational assistant that handles meeting bookings and emails.
+        prompt = f"""You are a meeting and email assistant. Today is {current_date}.
 
-CURRENT DATE: {current_date} ({current_date_iso})
-CURRENT CONTEXT:
-{context_str}
+    Current state: {current_intent or "None"}
+    Entities: {current_entities}
 
-{email_context}
+    User: "{user_input}"
 
-USER INPUT: "{user_input}"
 
-IMPORTANT: Respond with VALID JSON ONLY. Use DOUBLE QUOTES for all strings, not single quotes.
+    Rules:
+    - Don't assume date or time.
+    - For emails: clarify user intention.
+    - For meetings: need title, date, time, participants(emails)
+    - For emails: need recipient (valid email), subject and body
+    - Ask for missing info one at a time
+    - Only confirm when you have everything
+    - Use DOUBLE QUOTES in JSON
 
-CONTEXT RULES:
-- When user mentions relative dates, calculate actual date based on current date: {current_date_iso}
-- For emails, you need actual email addresses (with @domain.com)
-- If user gives names without email addresses, ask for the actual email addresses
-- If user says just names like "sarah and ahmed" when asked for emails, ask for their email addresses
-- Don't schedule or sent an email before you make sure you have all information
-- When user confirms ("yes") but info is still missing, ask for the missing info instead of executing
+    INTENT SWITCHING RULE:
+    - NEVER change intent from send_email to schedule_meeting
+    
+    Examples:
+    "hello" → greeting, offer help
+    "book meeting" → ask for title first
+    "project sync" → ask for date/time
+    "tomorrow 2pm" → ask for participants
+    "john@co.com" → confirm if complete, ask for more if not
+    "yes" → ready_to_execute: true
 
-Respond with valid JSON using DOUBLE QUOTES only:
-{{
-    "action_type": "new_intent|correction|confirmation|email_address_request",
-    "intent": "schedule_meeting|send_email|chitchat",
-    "entities": {{
-        "title": "meeting title or email subject",
-        "date": "YYYY-MM-DD format", 
-        "time": "time string",
-        "recipient": "email addresses for emails",
-        "participants": "participant names for meetings",
-        "subject": "email subject",
-        "body": "email body"
-    }},
-    "correction_detected": false,
-    "missing_entities": ["field1", "field2"],
-    "response": "Your conversational response",
-    "needs_confirmation": true,
-    "ready_to_execute": false
-}}
-
-CALCULATION EXAMPLES:
-- "tomorrow" = {(datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')}
-- "in 2 days" = {(datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d')}  
-- "next week" = {(datetime.now() + timedelta(weeks=1)).strftime('%Y-%m-%d')}
-- "in two weeks" = {(datetime.now() + timedelta(weeks=2)).strftime('%Y-%m-%d')}
-
-RULES:
-- Don't schedule a meeting before taking all informatin: date,time, participants emails.
-- If user says "actually", "wait", "change", "make it" etc. → correction_detected: true
-- For new requests → action_type: "new_intent"
-- For "yes"/"no" responses → action_type: "confirmation"
-- For corrections → only include changed entities
-- For confirmations → set ready_to_execute: true ONLY if all required info is present
-- If missing required info → ask for it and set needs_confirmation: false
-- When user asks to email people but only gives names, ask for email addresses
-
-EXAMPLES (valid JSON with DOUBLE QUOTES):
-
-Input: "I want to schedule a meeting"
-{{"action_type": "new_intent", "intent": "schedule_meeting", "entities": {{"title": "meeting"}}, "missing_entities": ["date", "time", "participants emails"], "response": "I'd be happy to schedule a meeting for you. When would you like to schedule it and what time?", "needs_confirmation": false, "ready_to_execute": false}}
-
-Input: "in 2 days" (when providing missing date info)
-{{"action_type": "correction", "intent": "schedule_meeting", "entities": {{"date": "{(datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d')}"}}, "correction_detected": true, "missing_entities": ["time"], "response": "Got it, in 2 days. What time would you like to schedule the meeting?", "needs_confirmation": false, "ready_to_execute": false}}
-
-Input: "at 3pm" (providing missing time)
-{{"action_type": "correction", "intent": "schedule_meeting", "entities": {{"time": "3pm"}}, "correction_detected": true, "response": "Perfect! Should I schedule the meeting for 2 days from now at 3pm?", "needs_confirmation": true, "ready_to_execute": false}}
-
-Input: "yes" (when confirming but still missing info like time)
-{{"action_type": "confirmation", "intent": "schedule_meeting", "entities": {{}}, "missing_entities": ["time"], "response": "Great! What time would you like to schedule the meeting?", "needs_confirmation": false, "ready_to_execute": false}}
-
-Input: "yes" (when all info is complete)
-{{"action_type": "confirmation", "ready_to_execute": true, "response": "Perfect! I'll schedule that meeting for you now.", "needs_confirmation": false}}
-
-Input: "sarah and ahmed" (when asked for email addresses)
-{{"action_type": "email_address_request", "intent": "send_email", "entities": {{}}, "response": "I need their actual email addresses. Could you provide sarah@company.com and ahmed@company.com (or their actual email addresses)?", "needs_confirmation": false, "ready_to_execute": false}}
-
-Input: "sarah@company.com and ahmed@company.com"
-{{"action_type": "new_intent", "intent": "send_email", "entities": {{"recipient": ["sarah@company.com", "ahmed@company.com"]}}, "response": "Perfect! Should I send an email to sarah@company.com and ahmed@company.com?", "needs_confirmation": true, "ready_to_execute": false}}
-"""
+    JSON format:
+    {{
+        "action_type": "greeting|new_intent|correction|confirmation",
+        "intent": "schedule_meeting|send_email|chitchat",
+        "entities": {{"title": "", "date": "{current_date}", "time": "", "participants": []}},
+        "response": "natural response",
+        "needs_confirmation": false,
+        "ready_to_execute": false
+    }}"""
         
         return prompt
     
@@ -192,8 +137,8 @@ Recent History: {context.get('history', [])[-3:] if context.get('history') else 
                         "content": prompt
                     }
                 ],
-                max_tokens=500,
-                temperature=0.3,  # Lower temperature for more consistent JSON
+                max_tokens=2000,
+                temperature=0.1,
                 top_p=1,
                 stream=False
             )

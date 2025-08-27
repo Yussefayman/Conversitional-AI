@@ -1,392 +1,341 @@
 # components/conversation_manager.py
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 import copy
 from .llm_client import LLMClient
-from utils.helpers import save_action_to_outbox, list_saved_actions, get_action_summary
+from utils.helpers import save_action_to_outbox, validate_email_addresses
 
 class ConversationManager:
-    def __init__(self, llm_client: LLMClient, outbox_dir: str = "outbox"):
-        """Initialize conversation manager with LLM client and outbox directory"""
+    """Streamlined conversation manager with clear confirmation flow"""
+    
+    def __init__(self, llm_client: LLMClient):
         self.llm_client = llm_client
-        self.outbox_dir = outbox_dir
-        self.max_history = 10  # Keep last 10 exchanges
-        
-        # Initialize conversation state
+        self.max_history = 10
         self._reset_state()
     
     def _reset_state(self):
-        """Reset conversation state"""
+        """Reset to empty state"""
         self.state = {
             "intent": None,
             "entities": {},
             "awaiting_confirmation": False,
-            "awaiting_email_addresses": False,  # Flag for email address requests
+            "user_confirmed": False,
             "history": [],
-            "session_active": False,
-            "last_saved_action": None  # Track the last saved action
+            "session_active": False
         }
     
+    # Main Processing
     def process_message(self, user_input: str) -> Dict[str, Any]:
-        """
-        Process user message and return response
-        
-        Args:
-            user_input: User's message
-            
-        Returns:
-            Dict with response, confirmation status, execution info, etc.
-        """
+        """Process user message and return response"""
         try:
-            # Build context for LLM
-            context = self._build_context_for_llm()
-            
-            # Get LLM response
+            context = self._build_context()
             llm_response = self.llm_client.process_message(user_input, context)
-            
-            # Update conversation state based on LLM response
-            self._update_state_from_llm_response(llm_response, user_input)
-            
-            # Check if action is ready for execution and auto-save
-            execution_result = self._handle_action_execution()
-            
-            # Add execution info to response
-            if execution_result:
-                llm_response["execution_result"] = execution_result
-            
-            # Add to history
+            self._update_state(llm_response, user_input)
             self._add_to_history(user_input, llm_response["response"])
-            
             return llm_response
-            
         except Exception as e:
-            # Fallback for errors
             error_response = {
                 "action_type": "error",
-                "intent": "chitchat",
-                "entities": {},
                 "response": "Sorry, I encountered an error. Could you try again?",
-                "needs_confirmation": False,
-                "ready_to_execute": False,
                 "error": str(e)
             }
-            
             self._add_to_history(user_input, error_response["response"])
             return error_response
     
-    def _handle_action_execution(self) -> Dict[str, Any]:
-        """
-        Handle automatic execution (saving) of ready actions
-        
-        Returns:
-            Dict with execution result info, or None if not ready
-        """
-        if not self.is_ready_for_execution():
-            return None
-        
-        try:
-            # Get action data
-            action_data = self.get_action_for_execution()
-            if not action_data:
-                return None
-            
-            # Save to outbox
-            save_result = save_action_to_outbox(action_data, self.outbox_dir)
-            
-            if save_result["success"]:
-                # Mark this action as saved
-                self.state["last_saved_action"] = {
-                    "filename": save_result["filename"],
-                    "filepath": save_result["filepath"],
-                    "action_type": action_data["type"],
-                    "summary": get_action_summary(action_data),
-                    "saved_at": datetime.now().isoformat()
-                }
-                
-                # Reset session after successful save
-                self._reset_session_after_execution()
-                
-                return {
-                    "success": True,
-                    "action_executed": True,
-                    "filename": save_result["filename"],
-                    "filepath": save_result["filepath"],
-                    "summary": get_action_summary(action_data),
-                    "message": f"✅ {action_data['type'].replace('_', ' ').title()} saved successfully!"
-                }
-            else:
-                return {
-                    "success": False,
-                    "action_executed": False,
-                    "error": save_result["error"],
-                    "message": f"❌ Failed to save {action_data['type']}: {save_result['error']}"
-                }
-                
-        except Exception as e:
-            return {
-                "success": False,
-                "action_executed": False,
-                "error": str(e),
-                "message": f"❌ Execution error: {str(e)}"
-            }
-    
-    def _reset_session_after_execution(self):
-        """Reset session state after successful action execution, but keep history"""
-        history = self.state["history"].copy()  # Preserve history
-        last_saved = self.state["last_saved_action"].copy()  # Preserve last saved action
-        
-        self._reset_state()
-        
-        self.state["history"] = history
-        self.state["last_saved_action"] = last_saved
-    
-    def _build_context_for_llm(self) -> Dict[str, Any]:
-        """Build context dictionary for LLM"""
+    def _build_context(self) -> Dict[str, Any]:
+        """Build context for LLM"""
         return {
             "intent": self.state["intent"],
             "entities": copy.deepcopy(self.state["entities"]),
             "awaiting_confirmation": self.state["awaiting_confirmation"],
-            "awaiting_email_addresses": self.state["awaiting_email_addresses"],
+            "user_confirmed": self.state["user_confirmed"],
             "session_active": self.state["session_active"],
-            "history": self.state["history"][-5:] if self.state["history"] else [],  # Last 5 for context
+            "missing_entities": self._get_missing_entities(),
+            "has_all_required": self._has_all_required_entities()
         }
     
-    def _update_state_from_llm_response(self, llm_response: Dict[str, Any], user_input: str):
-        """Update conversation state based on LLM response"""
-        
-        # Handle different action types
+    def _update_state(self, llm_response: Dict[str, Any], user_input: str):
+        """Update state based on LLM response"""
         action_type = llm_response.get("action_type", "chitchat")
         
         if action_type == "new_intent":
-            # Check if we're switching intents and need to ask for missing info
-            new_intent = llm_response.get("intent")
-            missing_entities = llm_response.get("missing_entities", [])
-            
-            # Special handling for email address requests
-            if (new_intent == "send_email" and 
-                self.state.get("intent") == "schedule_meeting" and 
-                "email_addresses" in missing_entities):
-                
-                # Don't fully switch intent yet, ask for missing info first
-                self.state["awaiting_confirmation"] = False
-                self.state["awaiting_email_addresses"] = True
-                
-            elif (new_intent == "send_email" and 
-                  self.state.get("awaiting_email_addresses")):
-                # User just provided email addresses
-                if llm_response.get("entities", {}).get("recipient"):
-                    self.state["entities"]["recipient"] = llm_response["entities"]["recipient"]
-                    self.state["intent"] = "send_email"
-                    self.state["awaiting_email_addresses"] = False
-                    self.state["awaiting_confirmation"] = llm_response.get("needs_confirmation", True)
-            else:
-                # Normal new intent processing
-                self.state["intent"] = new_intent
-                self.state["entities"] = llm_response.get("entities", {})
-                self.state["awaiting_confirmation"] = llm_response.get("needs_confirmation", False)
-                self.state["session_active"] = True
-                
-        elif action_type == "correction":
-            # Update only the corrected entities, keep others
-            if llm_response.get("correction_detected"):
-                corrected_entities = llm_response.get("entities", {})
-                self.state["entities"].update(corrected_entities)
-                self.state["awaiting_confirmation"] = llm_response.get("needs_confirmation", True)
-            
-        elif action_type == "confirmation":
-            # Handle yes/no responses
-            if llm_response.get("ready_to_execute"):
-                self.state["awaiting_confirmation"] = False
-                # Note: Actual execution handled in _handle_action_execution()
-            else:
-                # User said no - reset session
-                self._reset_state()
-                
-        elif action_type == "cancellation":
-            # User cancelled - reset
-            self._reset_state()
-            
-        elif action_type == "email_address_request":
-            # User provided names when we asked for emails
-            self.state["awaiting_email_addresses"] = True
+            self.state["intent"] = llm_response.get("intent")
+            self.state["entities"] = llm_response.get("entities", {})
+            self.state["session_active"] = True
             self.state["awaiting_confirmation"] = False
+            self.state["user_confirmed"] = False
+        
+        elif action_type == "correction":
+            corrected_entities = llm_response.get("entities", {})
+            self.state["entities"].update(corrected_entities)
             
-        elif action_type == "chitchat":
-            # Casual conversation - don't change session state much
+            # If we now have everything, prepare for confirmation
+            if self._has_all_required_entities() and not self.state["awaiting_confirmation"]:
+                self.state["awaiting_confirmation"] = True
+                # Override response with confirmation
+                confirmation_msg = self._build_confirmation_message()
+                llm_response["response"] = confirmation_msg
+                llm_response["needs_confirmation"] = True
+        
+        elif action_type == "confirmation":
+            if self._is_positive_response(user_input):
+                if self._has_all_required_entities():
+                    self.state["user_confirmed"] = True
+                    self.state["awaiting_confirmation"] = False
+                    llm_response["ready_to_execute"] = True
+                    llm_response["response"] = "Perfect! I'll take care of that now."
+                else:
+                    llm_response["response"] = "I need more information first."
+            else:
+                self._reset_state()
+                llm_response["response"] = "No problem! Cancelled. What else can I help with?"
+        
+        elif action_type == "greeting":
             if not self.state["session_active"]:
                 self.state["intent"] = "chitchat"
     
-    def _has_required_entities(self) -> bool:
-        """Check if we have all required entities for current intent"""
+    # Validation
+    def _has_all_required_entities(self) -> bool:
+        """Check if we have all required info including email addresses"""
         entities = self.state["entities"]
         
         if self.state["intent"] == "schedule_meeting":
-            required_fields = ["title", "date", "time"]
-            return all(
-                entities.get(field) and str(entities.get(field)).strip() 
-                for field in required_fields
-            )
+            # Must have title, date, time, and participants with email addresses
+            required_fields = ["title", "date", "time", "participants"]
             
+            # Check basic fields exist
+            for field in required_fields:
+                if not entities.get(field) or not str(entities.get(field)).strip():
+                    return False
+            
+            # Check participants have email addresses
+            participants = entities.get("participants", [])
+            if isinstance(participants, list):
+                # At least one participant must have valid email
+                return any("@" in str(p) for p in participants if p)
+            else:
+                return "@" in str(participants)
+        
         elif self.state["intent"] == "send_email":
-            has_recipient = entities.get("recipient") and str(entities.get("recipient")).strip()
-            has_content = (entities.get("body") and str(entities.get("body")).strip()) or \
-                         (entities.get("subject") and str(entities.get("subject")).strip())
-            return has_recipient and has_content
+            recipient = entities.get("recipient")
+            has_valid_recipient = recipient and validate_email_addresses(recipient)
+            has_content = (entities.get("subject") or entities.get("body"))
+            return has_valid_recipient and has_content
         
         return True
-
-    def _get_missing_entities(self) -> list:
-        """Get list of missing required entities"""
+    
+    def _get_missing_entities(self) -> List[str]:
+        """Get specific missing fields"""
         entities = self.state["entities"]
         missing = []
         
         if self.state["intent"] == "schedule_meeting":
-            required_fields = ["title", "date", "time"]
-            for field in required_fields:
-                if not (entities.get(field) and str(entities.get(field)).strip()):
-                    missing.append(field)
-                    
+            if not entities.get("title"):
+                missing.append("title")
+            if not entities.get("date"):
+                missing.append("date")
+            if not entities.get("time"):
+                missing.append("time")
+            if not entities.get("participants"):
+                missing.append("participants")
+            elif entities.get("participants"):
+                # Check if participants have email addresses
+                participants = entities.get("participants", [])
+                if isinstance(participants, list):
+                    has_emails = any("@" in str(p) for p in participants if p)
+                else:
+                    has_emails = "@" in str(participants)
+                
+                if not has_emails:
+                    missing.append("participant_emails")
+        
         elif self.state["intent"] == "send_email":
-            if not (entities.get("recipient") and str(entities.get("recipient")).strip()):
+            recipient = entities.get("recipient")
+            if not recipient:
                 missing.append("recipient")
-            if not ((entities.get("body") and str(entities.get("body")).strip()) or 
-                    (entities.get("subject") and str(entities.get("subject")).strip())):
-                missing.append("body_or_subject")
+            elif not validate_email_addresses(recipient):
+                missing.append("valid_email")
+            
+            if not (entities.get("subject") or entities.get("body")):
+                missing.append("content")
         
         return missing
     
-    def _update_state(self, new_state: Dict[str, Any]):
-        """Helper method to update state (for testing)"""
-        self.state.update(new_state)
-    
-    def _add_to_history(self, user_input: str, bot_response: str):
-        """Add exchange to conversation history"""
-        self.state["history"].append({
-            "user_input": user_input,
-            "bot_response": bot_response,
-            "timestamp": datetime.now().isoformat(),
-            "state_snapshot": copy.deepcopy(self.state["entities"])  # For debugging
-        })
-        
-        # Keep history manageable
-        if len(self.state["history"]) > self.max_history:
-            self.state["history"] = self.state["history"][-self.max_history:]
-    
-    def get_current_state(self) -> Dict[str, Any]:
-        """Get current conversation state"""
-        return copy.deepcopy(self.state)
-    
-    def get_state_display(self) -> str:
-        """Get formatted state for UI display"""
-        if not self.state["session_active"] and not self.state["intent"]:
-            return "💬 **Status:** Ready for new conversation\n\n*Start by saying something like:*\n- Book a meeting with...\n- Send an email to...\n- Hello!"
-        
-        # Format current session info
-        display_parts = []
-        
-        # Intent
-        if self.state["intent"]:
-            intent_emoji = "📅" if self.state["intent"] == "schedule_meeting" else "📧" if self.state["intent"] == "send_email" else "💬"
-            display_parts.append(f"{intent_emoji} **Intent:** {self.state['intent']}")
-        
-        # Entities
-        if self.state["entities"]:
-            display_parts.append("**📋 Details:**")
-            for key, value in self.state["entities"].items():
-                if value:  # Only show non-empty values
-                    display_parts.append(f"  • {key.title()}: {value}")
-        
-        # Status with more detail
-        if self.state["awaiting_confirmation"]:
-            display_parts.append("⏳ **Status:** Awaiting your confirmation")
-        elif self.state.get("awaiting_email_addresses"):
-            display_parts.append("📧 **Status:** Waiting for email addresses")
-        elif not self._has_required_entities():
-            missing = self._get_missing_entities()
-            missing_str = ", ".join(missing).replace("_", " ").title()
-            display_parts.append(f"📝 **Status:** Need more info ({missing_str})")
-        elif self.state["session_active"]:
-            if self.is_ready_for_execution():
-                display_parts.append("✅ **Status:** Ready to execute")
-            else:
-                display_parts.append("🔄 **Status:** Processing your request")
-        
-        # Show last saved action if any
-        if self.state.get("last_saved_action"):
-            last_saved = self.state["last_saved_action"]
-            display_parts.append(f"💾 **Last Saved:** {last_saved['summary']}")
-        
-        # Recent history count
-        if self.state["history"]:
-            display_parts.append(f"💭 **Exchanges:** {len(self.state['history'])}")
-        
-        return "\n\n".join(display_parts) if display_parts else "Ready"
-    
-    def reset_conversation(self):
-        """Reset the entire conversation"""
-        self._reset_state()
-    
-    def is_ready_for_execution(self) -> bool:
-        """Check if current action is ready to execute"""
-        if not (self.state["session_active"] and 
-                self.state["intent"] in ["schedule_meeting", "send_email"]):
-            return False
-        
-        # Check required entities based on intent
+    def _build_confirmation_message(self) -> str:
+        """Build specific confirmation message"""
+        intent = self.state["intent"]
         entities = self.state["entities"]
         
-        if self.state["intent"] == "schedule_meeting":
-            # Meeting needs at least title, date, and time
-            required_fields = ["title", "date", "time"]
-            has_all_required = all(
-                entities.get(field) and str(entities.get(field)).strip() 
-                for field in required_fields
-            )
-            return has_all_required and not self.state["awaiting_confirmation"]
+        if intent == "schedule_meeting":
+            title = entities.get("title", "meeting")
+            date = entities.get("date", "")
+            time = entities.get("time", "")
+            participants = entities.get("participants", [])
             
-        elif self.state["intent"] == "send_email":
-            # Email needs recipient and either subject+body or body
-            has_recipient = entities.get("recipient") and str(entities.get("recipient")).strip()
-            has_content = (entities.get("body") and str(entities.get("body")).strip()) or \
-                         (entities.get("subject") and str(entities.get("subject")).strip())
-            return has_recipient and has_content and not self.state["awaiting_confirmation"]
+            if isinstance(participants, list):
+                participants_str = ", ".join(participants)
+            else:
+                participants_str = str(participants)
+            
+            date_display = self._format_date(date)
+            return f"Should I schedule the '{title}' meeting for {date_display} at {time} with {participants_str}?"
         
-        return False
+        elif intent == "send_email":
+            recipients = entities.get("recipient", [])
+            subject = entities.get("subject", "")
+            body = entities.get("body", "")
+            
+            if isinstance(recipients, list):
+                recipients_str = ", ".join(recipients)
+            else:
+                recipients_str = str(recipients)
+            
+            if subject and body:
+                return f"Should I send an email to {recipients_str} with subject '{subject}' and message '{body[:30]}...'?"
+            elif subject:
+                return f"Should I send an email to {recipients_str} with subject '{subject}'?"
+            else:
+                return f"Should I send an email to {recipients_str} with message '{body[:50]}...'?"
+        
+        return "Should I proceed?"
     
-    def get_action_for_execution(self) -> Dict[str, Any]:
-        """Get the action data ready for execution/saving"""
+    def _format_date(self, date_str: str) -> str:
+        """Format date for display"""
+        try:
+            if len(date_str) == 10 and date_str.count('-') == 2:
+                date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                today = datetime.now().date()
+                if date_obj.date() == today:
+                    return "today"
+                elif date_obj.date() == today + timedelta(days=1):
+                    return "tomorrow"
+                else:
+                    return date_obj.strftime('%B %d')
+        except:
+            pass
+        return date_str
+    
+    def _is_positive_response(self, user_input: str) -> bool:
+        """Check if response is positive"""
+        positive = {"yes", "y", "yeah", "sure", "ok", "okay", "go ahead", "do it"}
+        negative = {"no", "n", "nope", "don't", "cancel", "stop"}
+        
+        clean_input = user_input.lower().strip()
+        
+        if clean_input in positive:
+            return True
+        elif clean_input in negative:
+            return False
+        
+        return "yes" in clean_input or "go" in clean_input
+    
+    # Execution
+    def is_ready_for_execution(self) -> bool:
+        """Check if ready to execute"""
+        return (
+            self.state["session_active"] and
+            self.state["intent"] in ["schedule_meeting", "send_email"] and
+            self._has_all_required_entities() and
+            self.state["user_confirmed"] and
+            not self.state["awaiting_confirmation"]
+        )
+    
+    def get_action_for_execution(self) -> Optional[Dict[str, Any]]:
+        """Get action data for execution"""
         if not self.is_ready_for_execution():
             return None
         
         return {
             "type": self.state["intent"],
-            "entities": self.state["entities"],
-            "timestamp": datetime.now().isoformat(),
-            "conversation_id": f"conv_{id(self)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            "entities": copy.deepcopy(self.state["entities"]),
+            "timestamp": datetime.now().isoformat()
         }
     
-    def get_saved_actions_summary(self, limit: int = 5) -> List[str]:
-        """Get a summary of recently saved actions"""
-        try:
-            actions = list_saved_actions(self.outbox_dir, limit=limit)
-            return [get_action_summary(action) for action in actions]
-        except Exception as e:
-            return [f"❌ Error loading saved actions: {str(e)}"]
-    
-    def get_outbox_stats(self) -> Dict[str, Any]:
-        """Get statistics about the outbox"""
-        try:
-            actions = list_saved_actions(self.outbox_dir)
-            
-            total = len(actions)
-            meeting_count = len([a for a in actions if a.get("type") == "schedule_meeting"])
-            email_count = len([a for a in actions if a.get("type") == "send_email"])
-            
+    def execute_action(self) -> Dict[str, Any]:
+        """Execute the action"""
+        if not self.is_ready_for_execution():
             return {
-                "total_actions": total,
-                "meetings": meeting_count,
-                "emails": email_count,
-                "last_saved": actions[0].get("saved_at") if actions else None
+                "success": False,
+                "error": "Not ready for execution",
+                "missing": self._get_missing_entities()
             }
-        except Exception as e:
-            return {"error": str(e)}
+        
+        action_data = self.get_action_for_execution()
+        result = save_action_to_outbox(action_data)
+        
+        if result["success"]:
+            self._reset_state()
+        
+        return result
+    
+    # State Management
+    def get_current_state(self) -> Dict[str, Any]:
+        """Get current state"""
+        return copy.deepcopy(self.state)
+    
+    def get_state_display(self) -> str:
+        """Get formatted state display"""
+        if not self.state["session_active"]:
+            return "Ready for new conversation\n\nTry: 'book a meeting' or 'send an email'"
+        
+        display_parts = []
+        
+        # Intent
+        if self.state["intent"]:
+            emoji = "📅" if self.state["intent"] == "schedule_meeting" else "📧"
+            display_parts.append(f"{emoji} **{self.state['intent']}**")
+        
+        # Entities
+        if self.state["entities"]:
+            display_parts.append("**Details:**")
+            for key, value in self.state["entities"].items():
+                if value:
+                    if key == "date":
+                        value = self._format_date(str(value))
+                    elif isinstance(value, list):
+                        value = ", ".join(str(v) for v in value)
+                    display_parts.append(f"  • {key.title()}: {value}")
+        
+        # Status
+        if self.state["awaiting_confirmation"]:
+            status = "⏳ Awaiting confirmation"
+        elif self.state["user_confirmed"]:
+            status = "✅ Ready to execute"
+        elif not self._has_all_required_entities():
+            missing = self._get_missing_entities()
+            status = f"📝 Need: {', '.join(missing)}"
+        else:
+            status = "🔄 Processing"
+        
+        display_parts.append(f"**Status:** {status}")
+        
+        if self.state["history"]:
+            display_parts.append(f"**Exchanges:** {len(self.state['history'])}")
+        
+        return "\n\n".join(display_parts)
+    
+    def reset_conversation(self):
+        """Reset conversation"""
+        self._reset_state()
+    
+    # History
+    def _add_to_history(self, user_input: str, bot_response: str):
+        """Add to history"""
+        self.state["history"].append({
+            "user_input": user_input,
+            "bot_response": bot_response,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        if len(self.state["history"]) > self.max_history:
+            self.state["history"] = self.state["history"][-self.max_history:]
+    
+    # Debug
+    def get_debug_info(self) -> Dict[str, Any]:
+        """Get debug info"""
+        return {
+            "state": self.get_current_state(),
+            "is_ready": self.is_ready_for_execution(),
+            "has_required": self._has_all_required_entities(),
+            "missing": self._get_missing_entities()
+        }

@@ -2,278 +2,337 @@
 import os
 import json
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
+import re
 
-def create_outbox_directory(outbox_path: str = "outbox") -> str:
-    """
-    Create the outbox directory if it doesn't exist
-    
-    Args:
-        outbox_path: Path to the outbox directory
-        
-    Returns:
-        str: Path to the created directory
-    """
-    try:
-        os.makedirs(outbox_path, exist_ok=True)
-        return outbox_path
-    except Exception as e:
-        raise Exception(f"Failed to create outbox directory: {str(e)}")
+def ensure_outbox_exists(outbox_path: str = "outbox") -> str:
+    """Ensure the outbox directory exists"""
+    if not os.path.exists(outbox_path):
+        os.makedirs(outbox_path)
+    return outbox_path
 
-def generate_filename(action_type: str, timestamp: Optional[str] = None) -> str:
-    """
-    Generate a unique filename for the action
-    
-    Args:
-        action_type: Type of action (schedule_meeting, send_email)
-        timestamp: Optional timestamp string, uses current time if not provided
-        
-    Returns:
-        str: Generated filename
-    """
-    if timestamp:
-        try:
-            # Parse the ISO timestamp and format for filename
-            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            time_str = dt.strftime('%Y%m%d_%H%M%S_%f')[:-3]  # Include milliseconds
-        except:
-            # Fallback to current time if parsing fails
-            time_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    else:
-        time_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    
-    return f"{action_type}_{time_str}.json"
-
-def validate_action_data(action_data: Dict[str, Any]) -> bool:
-    """
-    Validate that action data has required fields
-    
-    Args:
-        action_data: Action data dictionary
-        
-    Returns:
-        bool: True if valid, False otherwise
-    """
-    required_fields = ["type", "entities"]
-    
-    # Check required top-level fields
-    for field in required_fields:
-        if field not in action_data:
-            return False
-    
-    # Check that type is valid
-    valid_types = ["schedule_meeting", "send_email"]
-    if action_data["type"] not in valid_types:
+def validate_email_addresses(recipients) -> bool:
+    """Validate that recipients contain actual email addresses"""
+    if not recipients:
         return False
     
-    # Check that entities is a dict
-    if not isinstance(action_data["entities"], dict):
-        return False
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     
-    # Type-specific validation
-    entities = action_data["entities"]
+    if isinstance(recipients, str):
+        return bool(re.search(email_pattern, recipients))
+    elif isinstance(recipients, list):
+        return all(re.search(email_pattern, str(recipient)) for recipient in recipients if recipient)
     
-    if action_data["type"] == "schedule_meeting":
-        # Meeting should have at least title
-        if not entities.get("title"):
-            return False
-            
-    elif action_data["type"] == "send_email":
-        # Email should have recipient
-        if not entities.get("recipient"):
-            return False
-    
-    return True
+    return False
 
-def save_action_to_outbox(action_data: Dict[str, Any], outbox_dir: str = "outbox") -> Dict[str, Any]:
+def validate_meeting_data(entities: Dict[str, Any]) -> tuple[bool, list]:
     """
-    Save action data to a JSON file in the outbox directory
+    Validate meeting data has all required components
+    Returns: (is_valid, missing_fields)
+    """
+    required_fields = {
+        'title': 'Meeting title',
+        'date': 'Meeting date', 
+        'time': 'Meeting time'
+    }
     
-    Args:
-        action_data: Dictionary containing action data
-        outbox_dir: Directory to save the file in
-        
-    Returns:
-        Dict with success status, filename, filepath, and any error info
+    missing = []
+    for field, description in required_fields.items():
+        if not entities.get(field) or not str(entities.get(field)).strip():
+            missing.append(description)
+    
+    # Optional but recommended: participants
+    if not entities.get('participants'):
+        missing.append('Participants (recommended)')
+    
+    return len(missing) == 0 or (len(missing) == 1 and 'recommended' in missing[0].lower()), missing
+
+def validate_email_data(entities: Dict[str, Any]) -> tuple[bool, list]:
+    """
+    Validate email data has all required components
+    Returns: (is_valid, missing_fields)
+    """
+    missing = []
+    
+    # Check recipient (must be actual email addresses)
+    recipient = entities.get('recipient')
+    if not recipient:
+        missing.append('Recipient email address')
+    elif not validate_email_addresses(recipient):
+        missing.append('Valid email addresses (must contain @domain.com)')
+    
+    # Check content (need either body or subject, preferably both)
+    has_subject = entities.get('subject') and str(entities.get('subject')).strip()
+    has_body = entities.get('body') and str(entities.get('body')).strip()
+    
+    if not has_subject and not has_body:
+        missing.append('Email content (subject or body)')
+    elif not has_subject:
+        missing.append('Subject (recommended)')
+    elif not has_body:
+        missing.append('Body/message (recommended)')
+    
+    # Consider valid if we have recipient + (subject or body)
+    is_valid = (
+        recipient and validate_email_addresses(recipient) and 
+        (has_subject or has_body)
+    )
+    
+    return is_valid, missing
+
+def format_recipients_for_email(recipients) -> list:
+    """Format recipients as a clean list of email addresses"""
+    if not recipients:
+        return []
+    
+    if isinstance(recipients, str):
+        # Split by common delimiters and extract emails
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        emails = re.findall(email_pattern, recipients)
+        return emails if emails else [recipients]  # Fallback to original if no emails found
+    
+    elif isinstance(recipients, list):
+        formatted = []
+        for recipient in recipients:
+            if isinstance(recipient, str) and recipient.strip():
+                # Try to extract email from each recipient
+                email_matches = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', recipient)
+                if email_matches:
+                    formatted.extend(email_matches)
+                else:
+                    formatted.append(recipient.strip())
+        return formatted
+    
+    return [str(recipients)]
+
+def format_participants_for_meeting(participants) -> list:
+    """Format participants as a clean list (can be names or emails)"""
+    if not participants:
+        return []
+    
+    if isinstance(participants, str):
+        # Split by common delimiters
+        delimiters = [',', ';', ' and ', ' & ', '\n']
+        result = [participants]
+        for delimiter in delimiters:
+            temp = []
+            for item in result:
+                temp.extend([part.strip() for part in item.split(delimiter) if part.strip()])
+            result = temp
+        return result
+    
+    elif isinstance(participants, list):
+        return [str(p).strip() for p in participants if str(p).strip()]
+    
+    return [str(participants)]
+
+def save_meeting_action(entities: Dict[str, Any], outbox_path: str = "outbox") -> Dict[str, Any]:
+    """
+    Save meeting action to JSON file
+    Returns: result dict with success status and details
     """
     try:
-        # Validate input data
-        if not validate_action_data(action_data):
+        # Validate meeting data
+        is_valid, missing_fields = validate_meeting_data(entities)
+        if not is_valid:
             return {
                 "success": False,
-                "error": "Invalid action data format or missing required fields"
+                "error": f"Missing required fields: {', '.join(missing_fields)}",
+                "missing_fields": missing_fields
             }
         
-        # Ensure outbox directory exists
-        create_outbox_directory(outbox_dir)
+        # Ensure outbox exists
+        outbox_path = ensure_outbox_exists(outbox_path)
+        
+        # Prepare meeting data
+        meeting_data = {
+            "type": "schedule_meeting",
+            "title": entities.get('title', '').strip(),
+            "date": entities.get('date', '').strip(),
+            "time": entities.get('time', '').strip(),
+            "participants": format_participants_for_meeting(entities.get('participants')),
+            "location": entities.get('location', '').strip() if entities.get('location') else None,
+            "description": entities.get('description', '').strip() if entities.get('description') else None,
+            "created_at": datetime.now().isoformat(),
+            "status": "scheduled"
+        }
+        
+        # Remove None values
+        meeting_data = {k: v for k, v in meeting_data.items() if v is not None}
         
         # Generate filename
-        filename = generate_filename(
-            action_data["type"], 
-            action_data.get("timestamp")
-        )
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_title = re.sub(r'[^\w\-_\.]', '_', entities.get('title', 'meeting'))[:20]
+        filename = f"meeting_{safe_title}_{timestamp}.json"
+        filepath = os.path.join(outbox_path, filename)
         
-        filepath = os.path.join(outbox_dir, filename)
-        
-        # Add metadata to the action data
-        save_data = action_data.copy()
-        save_data["saved_at"] = datetime.now().isoformat()
-        save_data["filename"] = filename
-        
-        # Save to file with pretty formatting
+        # Save to file
         with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(save_data, f, indent=2, ensure_ascii=False)
+            json.dump(meeting_data, f, indent=2, ensure_ascii=False)
         
         return {
             "success": True,
             "filename": filename,
             "filepath": filepath,
-            "message": f"Action saved successfully as {filename}"
+            "data": meeting_data,
+            "message": f"Meeting '{meeting_data['title']}' saved successfully"
         }
         
     except Exception as e:
         return {
             "success": False,
-            "error": f"Failed to save action: {str(e)}"
+            "error": f"Failed to save meeting: {str(e)}"
         }
 
-def list_saved_actions(outbox_dir: str = "outbox", limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def save_email_action(entities: Dict[str, Any], outbox_path: str = "outbox") -> Dict[str, Any]:
     """
-    List all saved actions from the outbox directory
-    
-    Args:
-        outbox_dir: Directory to read from
-        limit: Maximum number of actions to return (most recent first)
-        
-    Returns:
-        List of action dictionaries
+    Save email action to JSON file
+    Returns: result dict with success status and details
     """
     try:
-        if not os.path.exists(outbox_dir):
-            return []
-        
-        actions = []
-        
-        # Get all JSON files
-        json_files = [f for f in os.listdir(outbox_dir) if f.endswith('.json')]
-        
-        # Sort by filename (which includes timestamp)
-        json_files.sort(reverse=True)  # Most recent first
-        
-        # Apply limit if specified
-        if limit:
-            json_files = json_files[:limit]
-        
-        # Read each file
-        for filename in json_files:
-            filepath = os.path.join(outbox_dir, filename)
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    action_data = json.load(f)
-                    action_data["filename"] = filename  # Ensure filename is included
-                    actions.append(action_data)
-            except Exception as e:
-                # Skip files that can't be read, but continue with others
-                print(f"Warning: Could not read {filename}: {str(e)}")
-                continue
-        
-        return actions
-        
-    except Exception as e:
-        print(f"Error listing saved actions: {str(e)}")
-        return []
-
-def get_action_summary(action_data: Dict[str, Any]) -> str:
-    """
-    Generate a human-readable summary of an action
-    
-    Args:
-        action_data: Action data dictionary
-        
-    Returns:
-        str: Human-readable summary
-    """
-    try:
-        action_type = action_data.get("type", "unknown")
-        entities = action_data.get("entities", {})
-        
-        if action_type == "schedule_meeting":
-            title = entities.get("title", "Meeting")
-            date = entities.get("date", "TBD")
-            time = entities.get("time", "TBD")
-            participants = entities.get("participants", [])
-            
-            summary = f"📅 {title}"
-            if date != "TBD" or time != "TBD":
-                summary += f" on {date} at {time}"
-            if participants:
-                if isinstance(participants, list):
-                    summary += f" with {', '.join(participants)}"
-                else:
-                    summary += f" with {participants}"
-            
-            return summary
-            
-        elif action_type == "send_email":
-            recipient = entities.get("recipient", "Unknown")
-            subject = entities.get("subject", entities.get("title", "No subject"))
-            
-            summary = f"📧 Email to {recipient}"
-            if subject:
-                summary += f": {subject}"
-            
-            return summary
-        
-        else:
-            return f"❓ Unknown action: {action_type}"
-            
-    except Exception:
-        return "❓ Could not generate summary"
-
-def clear_outbox(outbox_dir: str = "outbox", confirm: bool = False) -> Dict[str, Any]:
-    """
-    Clear all files from the outbox directory
-    
-    Args:
-        outbox_dir: Directory to clear
-        confirm: Must be True to actually delete files
-        
-    Returns:
-        Dict with success status and info about deleted files
-    """
-    if not confirm:
-        return {
-            "success": False,
-            "error": "Must set confirm=True to delete files"
-        }
-    
-    try:
-        if not os.path.exists(outbox_dir):
+        # Validate email data
+        is_valid, missing_fields = validate_email_data(entities)
+        if not is_valid:
             return {
-                "success": True,
-                "message": "Outbox directory doesn't exist - nothing to clear",
-                "files_deleted": 0
+                "success": False,
+                "error": f"Missing required fields: {', '.join(missing_fields)}",
+                "missing_fields": missing_fields
             }
         
-        json_files = [f for f in os.listdir(outbox_dir) if f.endswith('.json')]
-        files_deleted = 0
+        # Ensure outbox exists
+        outbox_path = ensure_outbox_exists(outbox_path)
         
-        for filename in json_files:
-            filepath = os.path.join(outbox_dir, filename)
-            try:
-                os.remove(filepath)
-                files_deleted += 1
-            except Exception as e:
-                print(f"Warning: Could not delete {filename}: {str(e)}")
+        # Prepare email data
+        recipients = format_recipients_for_email(entities.get('recipient'))
+        
+        email_data = {
+            "type": "send_email",
+            "recipients": recipients,
+            "subject": entities.get('subject', '').strip() or f"Message from Assistant",
+            "body": entities.get('body', '').strip() or entities.get('subject', '').strip(),
+            "cc": format_recipients_for_email(entities.get('cc')) if entities.get('cc') else [],
+            "bcc": format_recipients_for_email(entities.get('bcc')) if entities.get('bcc') else [],
+            "priority": entities.get('priority', 'normal'),
+            "created_at": datetime.now().isoformat(),
+            "status": "ready_to_send"
+        }
+        
+        # Remove empty lists
+        if not email_data["cc"]:
+            del email_data["cc"]
+        if not email_data["bcc"]:
+            del email_data["bcc"]
+        
+        # Generate filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_subject = re.sub(r'[^\w\-_\.]', '_', email_data['subject'])[:20]
+        filename = f"email_{safe_subject}_{timestamp}.json"
+        filepath = os.path.join(outbox_path, filename)
+        
+        # Save to file
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(email_data, f, indent=2, ensure_ascii=False)
         
         return {
             "success": True,
-            "message": f"Cleared {files_deleted} files from outbox",
-            "files_deleted": files_deleted
+            "filename": filename,
+            "filepath": filepath,
+            "data": email_data,
+            "message": f"Email to {', '.join(recipients[:2])}{'...' if len(recipients) > 2 else ''} saved successfully"
         }
         
     except Exception as e:
         return {
             "success": False,
-            "error": f"Failed to clear outbox: {str(e)}"
+            "error": f"Failed to save email: {str(e)}"
         }
+
+def save_action_to_outbox(action_data: Dict[str, Any], outbox_path: str = "outbox") -> Dict[str, Any]:
+    """
+    Main function to save any action to outbox
+    Routes to appropriate save function based on action type
+    """
+    if not action_data:
+        return {
+            "success": False,
+            "error": "No action data provided"
+        }
+    
+    action_type = action_data.get('type')
+    entities = action_data.get('entities', {})
+    
+    if action_type == "schedule_meeting":
+        return save_meeting_action(entities, outbox_path)
+    elif action_type == "send_email":
+        return save_email_action(entities, outbox_path)
+    else:
+        return {
+            "success": False,
+            "error": f"Unknown action type: {action_type}"
+        }
+
+def list_saved_actions(outbox_path: str = "outbox") -> Dict[str, Any]:
+    """List all saved actions in outbox"""
+    try:
+        if not os.path.exists(outbox_path):
+            return {
+                "success": True,
+                "actions": [],
+                "message": "No actions saved yet"
+            }
+        
+        files = []
+        for filename in os.listdir(outbox_path):
+            if filename.endswith('.json'):
+                filepath = os.path.join(outbox_path, filename)
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    files.append({
+                        "filename": filename,
+                        "type": data.get('type', 'unknown'),
+                        "created_at": data.get('created_at'),
+                        "summary": _get_action_summary(data)
+                    })
+                except Exception as e:
+                    files.append({
+                        "filename": filename,
+                        "type": "error",
+                        "error": str(e)
+                    })
+        
+        # Sort by creation time (newest first)
+        files.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        
+        return {
+            "success": True,
+            "actions": files,
+            "count": len(files)
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to list actions: {str(e)}"
+        }
+
+def _get_action_summary(data: Dict[str, Any]) -> str:
+    """Get a summary of an action for display"""
+    action_type = data.get('type', 'unknown')
+    
+    if action_type == "schedule_meeting":
+        title = data.get('title', 'Untitled Meeting')
+        date = data.get('date', 'No date')
+        time = data.get('time', 'No time')
+        return f"{title} on {date} at {time}"
+    
+    elif action_type == "send_email":
+        recipients = data.get('recipients', [])
+        subject = data.get('subject', 'No subject')
+        recipient_str = ', '.join(recipients[:2])
+        if len(recipients) > 2:
+            recipient_str += f" and {len(recipients) - 2} others"
+        return f"To {recipient_str}: {subject}"
+    
+    return "Unknown action"

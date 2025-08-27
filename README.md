@@ -22,11 +22,6 @@ Demo Link: https://drive.google.com/file/d/10kTzn8v1QTQiXtmhAnoTpesZMQviwnDD/vie
 - Python 3.8+
 - Groq API Key (free at [console.groq.com](https://console.groq.com))
 
-### Flow Diagram
-<img width="973" height="904" alt="image" src="https://github.com/user-attachments/assets/c8985bd7-33b1-4ea2-ad39-843a3f951b33" />
-
-
-
 ### Installation
 
 1. **Clone the repository**
@@ -58,6 +53,10 @@ Demo Link: https://drive.google.com/file/d/10kTzn8v1QTQiXtmhAnoTpesZMQviwnDD/vie
 5. **Open your browser**
    
    The app will automatically open at `http://127.0.0.1:7860`
+
+### Flow Diagram
+<img width="973" height="904" alt="image" src="https://github.com/user-attachments/assets/c8985bd7-33b1-4ea2-ad39-843a3f951b33" />
+
 
 ## 💬 Usage Examples
 

@@ -5,9 +5,7 @@ from typing import Dict, Any
 from datetime import datetime, timedelta
 import sys
 import os
-
 sys.path.append(os.getcwd())
-
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -87,7 +85,7 @@ class LLMClient:
 
     INTENT SWITCHING RULE:
     - NEVER change intent from send_email to schedule_meeting
-    
+
     Examples:
     "hello" → greeting, offer help
     "book meeting" → ask for title first
@@ -192,7 +190,6 @@ Recent History: {context.get('history', [])[-3:] if context.get('history') else 
             import re
             
             # Replace single quotes with double quotes for JSON keys and empty values
-            # Pattern: 'key': or ': '' or '[]' etc
             clean_response = re.sub(r"'([^']*)'(\s*:\s*)", r'"\1"\2', clean_response)  # Keys
             clean_response = re.sub(r":\s*'([^']*)'", r': "\1"', clean_response)  # String values
             clean_response = re.sub(r":\s*''", r': ""', clean_response)  # Empty strings
@@ -231,5 +228,5 @@ Recent History: {context.get('history', [])[-3:] if context.get('history') else 
                 "ready_to_execute": False,
                 "correction_detected": False,
                 "parse_error": str(e),
-                "raw_response": raw_response[:500]  # Truncate for display
+                "raw_response": raw_response[:500]  
             }

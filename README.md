@@ -2,6 +2,8 @@
 
 A smart conversational assistant built with Python and Gradio that can schedule meetings and send emails using natural language processing.
 
+Demo Link: https://drive.google.com/file/d/10kTzn8v1QTQiXtmhAnoTpesZMQviwnDD/view?usp=drive_link
+
 ## ✨ Features
 
 - **📅 Smart Meeting Scheduling**: Book meetings with natural language

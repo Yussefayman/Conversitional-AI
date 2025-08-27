@@ -1,7 +1,9 @@
+# components/llm_client.py
 import os
 import json
 from groq import Groq
 from typing import Dict, Any
+from datetime import datetime, timedelta
 
 class LLMClient:
     def __init__(self, api_key: str = None):
@@ -11,7 +13,7 @@ class LLMClient:
             raise ValueError("GROQ_API_KEY not found in environment variables")
         
         self.client = Groq(api_key=self.api_key)
-        self.model = "llama3-8b-8192" 
+        self.model = "llama3-70b-8192" 
     
     def process_message(self, user_input: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -49,58 +51,100 @@ class LLMClient:
             }
     
     def _build_prompt(self, user_input: str, context: Dict[str, Any]) -> str:
-        """Build the prompt for Groq"""
+        """Build the prompt for Groq with date awareness"""
         
         context_str = self._format_context(context)
+        current_date = datetime.now().strftime("%A, %B %d, %Y")
+        current_date_iso = datetime.now().strftime("%Y-%m-%d")
         
-        prompt = f"""You are a conversational assistant that handles meeting bookings, emails and chat.
+        # Check if we're waiting for email addresses
+        awaiting_emails = context.get("awaiting_email_addresses", False)
+        current_participants = context.get("entities", {}).get("participants", [])
+        
+        email_context = ""
+        if awaiting_emails and current_participants:
+            email_context = f"""
+SPECIAL CONTEXT: The user was asked for email addresses for these people: {current_participants}
+If the user provides names like "sarah and ahmed", convert them to email format or ask for actual email addresses.
+If the user provides email addresses, use those directly.
+"""
+        
+        prompt = f"""You are a conversational assistant that handles meeting bookings and emails.
 
+CURRENT DATE: {current_date} ({current_date_iso})
 CURRENT CONTEXT:
 {context_str}
 
+{email_context}
+
 USER INPUT: "{user_input}"
 
-Analyze this input and respond with valid JSON only (no other text):
+IMPORTANT: Respond with VALID JSON ONLY. Use DOUBLE QUOTES for all strings, not single quotes.
+
+CONTEXT RULES:
+- When user mentions relative dates, calculate actual date based on current date: {current_date_iso}
+- For emails, you need actual email addresses (with @domain.com)
+- If user gives names without email addresses, ask for the actual email addresses
+- If user says just names like "sarah and ahmed" when asked for emails, ask for their email addresses
+- When user confirms ("yes") but info is still missing, ask for the missing info instead of executing
+
+Respond with valid JSON using DOUBLE QUOTES only:
 {{
-    "action_type": "new_intent|correction|confirmation|chitchat",
+    "action_type": "new_intent|correction|confirmation|email_address_request",
     "intent": "schedule_meeting|send_email|chitchat",
     "entities": {{
-        "title": "...",
-        "date": "...", 
-        "time": "...",
-        "recipient": "...",
-        "subject": "...",
-        "body": "..."
+        "title": "meeting title or email subject",
+        "date": "YYYY-MM-DD format", 
+        "time": "time string",
+        "recipient": "email addresses for emails",
+        "participants": "participant names for meetings",
+        "subject": "email subject",
+        "body": "email body"
     }},
-    "correction_detected": true/false,
-    "missing_entities": ["time", "date"],
-    "response": "Your conversational response to the user",
-    "needs_confirmation": true/false,
-    "ready_to_execute": true/false
+    "correction_detected": false,
+    "missing_entities": ["field1", "field2"],
+    "response": "Your conversational response",
+    "needs_confirmation": true,
+    "ready_to_execute": false
 }}
+
+CALCULATION EXAMPLES:
+- "tomorrow" = {(datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')}
+- "in 2 days" = {(datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d')}  
+- "next week" = {(datetime.now() + timedelta(weeks=1)).strftime('%Y-%m-%d')}
+- "in two weeks" = {(datetime.now() + timedelta(weeks=2)).strftime('%Y-%m-%d')}
 
 RULES:
 - If user says "actually", "wait", "change", "make it" etc. → correction_detected: true
 - For new requests → action_type: "new_intent"
 - For "yes"/"no" responses → action_type: "confirmation"
 - For corrections → only include changed entities
-- For confirmations → set ready_to_execute: true if user confirms
-- Be conversational and natural in responses
+- For confirmations → set ready_to_execute: true ONLY if all required info is present
 - If missing required info → ask for it and set needs_confirmation: false
+- When user asks to email people but only gives names, ask for email addresses
 
-EXAMPLES:
+EXAMPLES (valid JSON with DOUBLE QUOTES):
 
-Input: "Book meeting with Sara tomorrow at 3pm"
-Output: {{"action_type": "new_intent", "intent": "schedule_meeting", "entities": {{"title": "meeting with Sara", "date": "tomorrow", "time": "3pm"}}, "correction_detected": false, "response": "Should I book a meeting with Sara tomorrow at 3pm?", "needs_confirmation": true, "ready_to_execute": false}}
+Input: "I want to schedule a meeting"
+{{"action_type": "new_intent", "intent": "schedule_meeting", "entities": {{"title": "meeting"}}, "missing_entities": ["date", "time"], "response": "I'd be happy to schedule a meeting for you. When would you like to schedule it and what time?", "needs_confirmation": false, "ready_to_execute": false}}
 
-Input: "actually make it 4pm"
-Output: {{"action_type": "correction", "intent": "schedule_meeting", "entities": {{"time": "4pm"}}, "correction_detected": true, "response": "Updated to 4pm. Should I proceed?", "needs_confirmation": true, "ready_to_execute": false}}
+Input: "in 2 days" (when providing missing date info)
+{{"action_type": "correction", "intent": "schedule_meeting", "entities": {{"date": "{(datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d')}"}}, "correction_detected": true, "missing_entities": ["time"], "response": "Got it, in 2 days. What time would you like to schedule the meeting?", "needs_confirmation": false, "ready_to_execute": false}}
 
-Input: "yes"
-Output: {{"action_type": "confirmation", "ready_to_execute": true, "response": "Perfect! I'll take care of that now.", "needs_confirmation": false}}
+Input: "at 3pm" (providing missing time)
+{{"action_type": "correction", "intent": "schedule_meeting", "entities": {{"time": "3pm"}}, "correction_detected": true, "response": "Perfect! Should I schedule the meeting for 2 days from now at 3pm?", "needs_confirmation": true, "ready_to_execute": false}}
 
-Input: "Send email to john@company.com about the delay"
-Output: {{"action_type": "new_intent", "intent": "send_email", "entities": {{"recipient": "john@company.com", "body": "about the delay"}}, "response": "Should I send an email to john@company.com with the message: 'about the delay'?", "needs_confirmation": true, "ready_to_execute": false}}
+Input: "yes" (when confirming but still missing info like time)
+{{"action_type": "confirmation", "intent": "schedule_meeting", "entities": {{}}, "missing_entities": ["time"], "response": "Great! What time would you like to schedule the meeting?", "needs_confirmation": false, "ready_to_execute": false}}
+
+Input: "yes" (when all info is complete)
+{{"action_type": "confirmation", "ready_to_execute": true, "response": "Perfect! I'll schedule that meeting for you now.", "needs_confirmation": false}}
+
+Input: "sarah and ahmed" (when asked for email addresses)
+{{"action_type": "email_address_request", "intent": "send_email", "entities": {{}}, "response": "I need their actual email addresses. Could you provide sarah@company.com and ahmed@company.com (or their actual email addresses)?", "needs_confirmation": false, "ready_to_execute": false}}
+
+Input: "sarah@company.com and ahmed@company.com"
+{{"action_type": "new_intent", "intent": "send_email", "entities": {{"recipient": ["sarah@company.com", "ahmed@company.com"]}}, "response": "Perfect! Should I send an email to sarah@company.com and ahmed@company.com?", "needs_confirmation": true, "ready_to_execute": false}}
 """
         
         return prompt
@@ -114,7 +158,9 @@ Output: {{"action_type": "new_intent", "intent": "send_email", "entities": {{"re
 Current Intent: {context.get('intent', 'None')}
 Current Entities: {context.get('entities', {})}
 Awaiting Confirmation: {context.get('awaiting_confirmation', False)}
-History: {context.get('history', [])}
+Awaiting Email Addresses: {context.get('awaiting_email_addresses', False)}
+Session Active: {context.get('session_active', False)}
+Recent History: {context.get('history', [])[-3:] if context.get('history') else []}
 """
     
     def _call_groq(self, prompt: str) -> str:
@@ -133,8 +179,8 @@ History: {context.get('history', [])}
                     }
                 ],
                 max_tokens=500,
-                temperature=0.1,
-                top_p=3,
+                temperature=0.3,  # Lower temperature for more consistent JSON
+                top_p=1,
                 stream=False
             )
             
@@ -144,15 +190,56 @@ History: {context.get('history', [])}
             raise Exception(f"Groq API call failed: {str(e)}")
     
     def _parse_response(self, raw_response: str) -> Dict[str, Any]:
-        """Parse the JSON response from Groq"""
+        """Parse the JSON response from Groq with better cleaning"""
         try:
-            # Clean up response (remove any markdown formatting)
+            # Clean up response (remove any markdown formatting and comments)
             clean_response = raw_response.strip()
+            
+            # Remove markdown code blocks
             if clean_response.startswith("```json"):
                 clean_response = clean_response[7:]
+            if clean_response.startswith("```"):
+                clean_response = clean_response[3:]
             if clean_response.endswith("```"):
                 clean_response = clean_response[:-3]
+            
             clean_response = clean_response.strip()
+            
+            # Remove JavaScript-style comments (// comments)
+            lines = clean_response.split('\n')
+            cleaned_lines = []
+            for line in lines:
+                # Remove comments after //
+                if '//' in line:
+                    # Find // that's not inside a string
+                    in_string = False
+                    quote_char = None
+                    for i, char in enumerate(line):
+                        if char in ['"', "'"] and (i == 0 or line[i-1] != '\\'):
+                            if not in_string:
+                                in_string = True
+                                quote_char = char
+                            elif char == quote_char:
+                                in_string = False
+                                quote_char = None
+                        elif char == '/' and i < len(line) - 1 and line[i+1] == '/' and not in_string:
+                            line = line[:i].rstrip()
+                            break
+                cleaned_lines.append(line)
+            
+            clean_response = '\n'.join(cleaned_lines)
+            
+            # Fix single quotes to double quotes in JSON (but not inside string values)
+            import re
+            
+            # Replace single quotes with double quotes for JSON keys and empty values
+            # Pattern: 'key': or ': '' or '[]' etc
+            clean_response = re.sub(r"'([^']*)'(\s*:\s*)", r'"\1"\2', clean_response)  # Keys
+            clean_response = re.sub(r":\s*'([^']*)'", r': "\1"', clean_response)  # String values
+            clean_response = re.sub(r":\s*''", r': ""', clean_response)  # Empty strings
+            
+            # Remove any trailing commas before closing braces/brackets
+            clean_response = re.sub(r',(\s*[}\]])', r'\1', clean_response)
             
             # Parse JSON
             parsed = json.loads(clean_response)
@@ -185,5 +272,5 @@ History: {context.get('history', [])}
                 "ready_to_execute": False,
                 "correction_detected": False,
                 "parse_error": str(e),
-                "raw_response": raw_response
+                "raw_response": raw_response[:500]  # Truncate for display
             }
